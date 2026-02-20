@@ -1,0 +1,2 @@
+RUN=/home/ryan529/project/transformer/runs/hardware_aware_bdd100k_v1_init_best_$(date +%Y%m%d_%H%M%S)
+ /home/ryan529/miniconda3/envs/pytorch_cu130_py311_t210/bin/python engine/train.py   --cfg configs/cfg_hardware_aware_bdd100k_v1.json   --init-detector /home/ryan529/project/transformer/runs/hardware_aware_bdd100k_v1_init_best_20260218_163038/ckpt/best_mAP50.pt   --set output_dir="$RUN"   --set ckpt.ckpt_dir="$RUN/ckpt"   --set ckpt.step.out_dir="$RUN/ckpt/steps"   --set ckpt.resume=

@@ -1,0 +1,46 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Build outputs
+build/
+dist/
+
+# Training / experiment artifacts
+**/runs/
+**/vis*/
+**/logs/
+**/ckpt/
+**/checkpoints/
+**/tensorboard/
+**/wandb/
+
+# Model artifacts
+**/*.pt
+**/*.pth
+**/*.ckpt
+**/*.onnx
+**/*.engine
+
+# Local dataset artifacts
+bdd100k/images/
+bdd100k/labels/
+bdd100k/raw10/
+bdd100k/raw10_npy/
+bdd100k/*.zip

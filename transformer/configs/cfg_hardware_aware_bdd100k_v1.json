@@ -1,0 +1,203 @@
+{
+  "seed": 1337,
+  "output_dir": "runs/hardware_aware_bdd100k_v1",
+  "epochs": 120,
+  "log_interval": 20,
+
+  "data": {
+    "train_merged_json": "/home/ryan529/project/transformer/configs/train_merged.json",
+    "val_merged_json": "/home/ryan529/project/transformer/configs/val_merged.json",
+    "raw_train": "/home/ryan529/project/bdd100k/raw10_npy/train",
+    "raw_val": "/home/ryan529/project/bdd100k/raw10_npy/val",
+
+    "in_h": 360,
+    "in_w": 640,
+    "pad_multiple": 8,
+    "keep_aspect": false,
+    "ann_src_size": [1280, 720],
+    "ann_src_is_hw": false,
+
+    "batch_size": 8,
+    "val_batch_size": 8,
+    "num_workers": 8,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "prefetch_factor": 4,
+    "drop_last": true,
+    "timeout": 0,
+
+    "augment": true,
+    "shuffle_train": true,
+    "shuffle_val": false,
+    "allow_empty_val": false,
+    "use_dali": false
+  },
+
+  "detector": {
+    "arch": "dual_stage_backbone",
+    "num_classes": 4,
+    "num_queries": 100,
+    "d_model": 256,
+    "nhead": 8,
+    "dropout": 0.1,
+    "attn_dtype": "bf16",
+    "pred_box_space": "normalized",
+
+    "dual_backbone_base_c": 64,
+    "dual_token_counts": [16, 32, 64, 96],
+    "dual_pe_max_h": 360,
+    "dual_pe_max_w": 640,
+    "dual_bbox_hidden_dim": 256,
+    "dual_token_ffn_mult": 2.0,
+    "dual_query_prior": "anchor",
+    "dual_query_prior_init": "grid",
+    "dual_anchor_wh_prior": 0.2,
+
+    "dual_backbone_stem_kind": "cfa_grouped",
+    "dual_backbone_act": "relu",
+    "dual_backbone_bn_eps": 1e-5,
+    "dual_backbone_bottleneck_local_blocks": 2,
+    "dual_backbone_gc_reduction": 8,
+    "dual_backbone_gc_gate": "hard_sigmoid",
+    "dual_backbone_gc_clamp_alpha": 0.2,
+    "dual_backbone_gc_clamp_beta": 0.5
+  },
+
+  "trainopt": {
+    "train_mode": "detector_only",
+    "enable_detector": true,
+    "freeze_detector": false,
+
+    "mixed_precision": "bf16",
+    "mixed_precision_detector": "bf16",
+    "grad_accum_steps": 1,
+
+    "channels_last": false,
+    "compile_detector": false,
+    "compile_backend": "inductor",
+    "compile_mode": "default",
+
+    "allow_tf32": true,
+    "force_math_sdp": false,
+    "skip_finite_checks": true,
+    "loss_guard_policy": "fail",
+
+    "calc_val_loss": false,
+    "calc_large_ap": false,
+    "val_max_batches": 0,
+    "val_log_every": 50,
+
+    "check_grads_after_backward": false,
+    "dump_model_params": true,
+    "grad_firewall": false,
+    "debug": false
+  },
+
+  "optim": {
+    "name": "adamw",
+    "lr": 0.0002,
+    "lr_detector": 0.0002,
+    "weight_decay": 0.0001,
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "clip_norm_detector": 0.6,
+    "fused": false,
+    "weight_decay_norm": 0.0,
+    "weight_decay_bias": 0.0
+  },
+
+  "sched": {
+    "detector": {
+      "type": "cosine",
+      "warmup_steps": 1200,
+      "warmup_init_lr": 2e-5,
+      "total_steps": 104000,
+      "min_lr": 2e-6
+    }
+  },
+
+  "loss_detector": {
+    "cost_class": 2.0,
+    "cost_bbox": 5.0,
+    "cost_giou": 2.0,
+
+    "cls_loss_weight": 1.0,
+    "bbox_loss_weight": 6.0,
+    "giou_loss_weight": 2.0,
+
+    "eos_coef": 0.1,
+    "focal_ce": false,
+    "qfl_align": false,
+    "qfl_weight": 0.0,
+
+    "box_encoding": "sigmoid",
+    "iou_type": "giou",
+    "alpha_iou": 2.0,
+    "cls_normalize": "num_boxes",
+
+    "min_box_wh": 0.001,
+    "min_box_penalty": 0.01,
+    "wh_log_l1_weight": 0.2,
+
+    "object_token_l2_weight": 0.0,
+    "object_token_diversity_weight": 0.0,
+    "object_token_diversity_margin": 0.1,
+    "object_token_var_weight": 0.0,
+    "object_token_var_target": 0.25,
+    "scale_token_balance_weight": 0.0,
+    "query_bg_balance_weight": 0.0,
+    "query_bg_target": 0.70,
+
+    "k_one2many": 0,
+    "lambda_one2many": 1.0,
+    "aux_apply_one2many": false,
+    "matcher_batch_cpu_copy_max_numel": 8000000,
+
+    "debug": false
+  },
+
+  "metrics_detector": {
+    "score_thr": 0.0,
+    "max_dets": 100,
+    "num_classes": 4,
+    "nms_iou": null
+  },
+
+  "eval": {
+    "enable": true,
+    "interval_epochs": 1,
+    "save_best_metric": "det/mAP50",
+    "best_metric_mode": "max",
+    "save_best_topk": 3,
+    "early_stop_patience": 20,
+    "early_stop_min_delta": 0.0
+  },
+
+  "ema": {
+    "enable_detector": false,
+    "decay": 0.9995,
+    "device": "cpu",
+    "include_buffers": true
+  },
+
+  "ckpt": {
+    "resume": null,
+    "init_dual": null,
+    "init_detector": null,
+    "ckpt_dir": "runs/hardware_aware_bdd100k_v1/ckpt",
+    "keep_last": 6,
+    "interval_steps": 1000,
+    "keep_last_steps": 5,
+    "save_dual": true,
+    "step": {
+      "every_n_steps": 1000,
+      "out_dir": "runs/hardware_aware_bdd100k_v1/ckpt/steps",
+      "tag_prefix": "g",
+      "keep_last_k": 5,
+      "save_optim": true,
+      "save_sched": true,
+      "save_scaler": true,
+      "save_ema": true
+    }
+  }
+}
