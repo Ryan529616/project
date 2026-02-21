@@ -17,7 +17,8 @@ import os
 import random
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 import torch
@@ -37,6 +38,19 @@ from configs.config import Cfg
 from data.dataloaders import build_dataloaders
 from engine.losses.detr_losses import build_detr_detection_loss
 from engine.metrics.detr_metrics import AveragePrecisionMeter, CocoAveragePrecisionMeter
+
+_OFFICIAL_RTDETR_CKPTS: Dict[str, str] = {
+    # RT-DETR v0.1 (from Paddle)
+    "r18_6x_coco": "https://github.com/lyuwenyu/storage/releases/download/v0.1/rtdetr_r18vd_6x_coco_from_paddle.pth",
+    "r34_6x_coco": "https://github.com/lyuwenyu/storage/releases/download/v0.1/rtdetr_r34vd_6x_coco_from_paddle.pth",
+    "r50_6x_coco": "https://github.com/lyuwenyu/storage/releases/download/v0.1/rtdetr_r50vd_6x_coco_from_paddle.pth",
+    "r101_6x_coco": "https://github.com/lyuwenyu/storage/releases/download/v0.1/rtdetr_r101vd_6x_coco_from_paddle.pth",
+    # RT-DETR v1.0 rerun
+    "r18_120e_coco": "https://github.com/lyuwenyu/storage/releases/download/v1.0/rtdetr_r18vd_120e_coco_rerun_48.1.pth",
+    "r34_120e_coco": "https://github.com/lyuwenyu/storage/releases/download/v1.0/rtdetr_r34vd_120e_coco_rerun_53.1.pth",
+    "r50m_120e_coco": "https://github.com/lyuwenyu/storage/releases/download/v1.0/rtdetr_r50vd_m_120e_coco_rerun_54.3.pth",
+    "r50_120e_coco": "https://github.com/lyuwenyu/storage/releases/download/v1.0/rtdetr_r50vd_6x_coco_rerun_54.2.pth",
+}
 
 
 def set_seed(seed: int) -> None:
@@ -99,6 +113,398 @@ def make_data_cfg(args: argparse.Namespace) -> Cfg:
 def write_jsonl(path: str, row: Dict[str, Any]) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _is_http_url(s: str) -> bool:
+    try:
+        p = urlparse(str(s))
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
+
+
+def _resolve_pretrain_ckpt_source(ckpt: str, cache_dir: str) -> Tuple[str, str]:
+    raw = str(ckpt or "").strip()
+    if not raw:
+        raise ValueError("empty pretrain checkpoint path")
+
+    source_desc = "local"
+    url: Optional[str] = None
+    if raw.lower().startswith("official:"):
+        alias = raw.split(":", 1)[1].strip().lower()
+        if alias not in _OFFICIAL_RTDETR_CKPTS:
+            raise KeyError(f"unknown official RT-DETR alias: {alias}. available={sorted(_OFFICIAL_RTDETR_CKPTS.keys())}")
+        url = _OFFICIAL_RTDETR_CKPTS[alias]
+        source_desc = f"official:{alias}"
+    elif _is_http_url(raw):
+        url = raw
+        source_desc = "url"
+
+    if url is None:
+        return raw, source_desc
+
+    cache_root = os.path.expanduser(str(cache_dir))
+    os.makedirs(cache_root, exist_ok=True)
+    fn = os.path.basename(urlparse(url).path) or "checkpoint.pth"
+    local_path = os.path.join(cache_root, fn)
+    if not os.path.isfile(local_path):
+        torch.hub.download_url_to_file(url, local_path, progress=True)
+    return local_path, source_desc
+
+
+def _safe_torch_load(path: str) -> Any:
+    try:
+        return torch.load(path, map_location="cpu")
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+    except Exception:
+        pass
+
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)  # type: ignore[arg-type]
+    except Exception:
+        return torch.load(path, map_location="cpu", weights_only=True)  # type: ignore[arg-type]
+
+
+def _dict_tensor_count(d: Dict[str, Any]) -> int:
+    return sum(1 for v in d.values() if torch.is_tensor(v))
+
+
+def _dict_like_state_dict(d: Dict[str, Any]) -> bool:
+    return _dict_tensor_count(d) > 0
+
+
+def _nested_get_dict(blob: Dict[str, Any], key_path: str) -> Optional[Dict[str, Any]]:
+    cur: Any = blob
+    for part in str(key_path).split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part, None)
+        if cur is None:
+            return None
+    return cur if isinstance(cur, dict) else None
+
+
+def _discover_state_dict_like(blob: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    preferred_roots = ("model", "state_dict", "module", "detector", "detr")
+    for k in preferred_roots:
+        v = blob.get(k, None)
+        if isinstance(v, dict) and _dict_like_state_dict(v):
+            return v
+
+    ema = blob.get("ema", None)
+    if isinstance(ema, dict):
+        for k in ("module", "model", "state_dict"):
+            v = ema.get(k, None)
+            if isinstance(v, dict) and _dict_like_state_dict(v):
+                return v
+
+    if _dict_like_state_dict(blob):
+        return blob
+
+    best: Optional[Dict[str, Any]] = None
+    best_score = 0
+    queue: List[Tuple[Dict[str, Any], int]] = [(blob, 0)]
+    while queue:
+        cur, depth = queue.pop(0)
+        score = _dict_tensor_count(cur)
+        if score > best_score:
+            best_score = score
+            best = cur
+        if depth >= 4:
+            continue
+        for v in cur.values():
+            if isinstance(v, dict):
+                queue.append((v, depth + 1))
+
+    if best is not None and best_score > 0:
+        return best
+    return None
+
+
+def _extract_state_dict(blob: Any, prefer_key: Optional[str]) -> Dict[str, Any]:
+    if not isinstance(blob, dict):
+        raise RuntimeError(f"checkpoint payload must be a dict, got {type(blob).__name__}")
+
+    if prefer_key:
+        picked = _nested_get_dict(blob, str(prefer_key))
+        if isinstance(picked, dict):
+            nested = _discover_state_dict_like(picked)
+            if isinstance(nested, dict):
+                return nested
+            if _dict_like_state_dict(picked):
+                return picked
+        print(
+            f"[warn] pretrain_key='{prefer_key}' not found as usable state_dict; fallback to auto discovery",
+            flush=True,
+        )
+
+    auto_sd = _discover_state_dict_like(blob)
+    if isinstance(auto_sd, dict):
+        return auto_sd
+
+    raise RuntimeError("checkpoint does not contain a usable state_dict")
+
+
+def _strip_wrapper_prefixes(key: str) -> str:
+    wrappers = {"module", "model", "state_dict", "net", "detector", "detr", "ema", "student", "teacher"}
+    parts = str(key).split(".")
+    while parts and parts[0] in wrappers:
+        parts = parts[1:]
+    return ".".join(parts)
+
+
+def _alias_candidate_keys(src_key: str) -> List[str]:
+    cands: List[str] = []
+
+    def _add(k: Optional[str]) -> None:
+        if isinstance(k, str) and k and (k not in cands):
+            cands.append(k)
+
+    k = str(src_key)
+    _add(k)
+
+    if k.startswith("backbone.backbone."):
+        _add("backbone." + k[len("backbone.backbone."):])
+
+    if k.startswith("backbone.0.body."):
+        tail = k[len("backbone.0.body."):]
+        if tail.startswith("conv1."):
+            _add("backbone.stem.0." + tail[len("conv1."):])
+        elif tail.startswith("bn1."):
+            _add("backbone.stem.1." + tail[len("bn1."):])
+        elif tail.startswith("layer1."):
+            _add("backbone.layer1." + tail[len("layer1."):])
+        elif tail.startswith("layer2."):
+            _add("backbone.layer2." + tail[len("layer2."):])
+        elif tail.startswith("layer3."):
+            _add("backbone.layer3." + tail[len("layer3."):])
+        elif tail.startswith("layer4."):
+            _add("backbone.layer4." + tail[len("layer4."):])
+
+    if k.startswith("backbone.body."):
+        tail = k[len("backbone.body."):]
+        if tail.startswith("conv1."):
+            _add("backbone.stem.0." + tail[len("conv1."):])
+        elif tail.startswith("bn1."):
+            _add("backbone.stem.1." + tail[len("bn1."):])
+        elif tail.startswith("layer1."):
+            _add("backbone.layer1." + tail[len("layer1."):])
+        elif tail.startswith("layer2."):
+            _add("backbone.layer2." + tail[len("layer2."):])
+        elif tail.startswith("layer3."):
+            _add("backbone.layer3." + tail[len("layer3."):])
+        elif tail.startswith("layer4."):
+            _add("backbone.layer4." + tail[len("layer4."):])
+
+    if k.startswith("backbone.0."):
+        _add("backbone.stem.0." + k[len("backbone.0."):])
+    if k.startswith("backbone.1."):
+        _add("backbone.stem.1." + k[len("backbone.1."):])
+    if k.startswith("backbone.4."):
+        _add("backbone.layer1." + k[len("backbone.4."):])
+    if k.startswith("backbone.5."):
+        _add("backbone.layer2." + k[len("backbone.5."):])
+    if k.startswith("backbone.6."):
+        _add("backbone.layer3." + k[len("backbone.6."):])
+    if k.startswith("backbone.7."):
+        _add("backbone.layer4." + k[len("backbone.7."):])
+
+    if k.startswith("conv1."):
+        _add("backbone.stem.0." + k[len("conv1."):])
+    if k.startswith("bn1."):
+        _add("backbone.stem.1." + k[len("bn1."):])
+    if k.startswith("layer1."):
+        _add("backbone.layer1." + k[len("layer1."):])
+    if k.startswith("layer2."):
+        _add("backbone.layer2." + k[len("layer2."):])
+    if k.startswith("layer3."):
+        _add("backbone.layer3." + k[len("layer3."):])
+    if k.startswith("layer4."):
+        _add("backbone.layer4." + k[len("layer4."):])
+
+    if k.startswith("backbone.conv1."):
+        _add("backbone.stem.0." + k[len("backbone.conv1."):])
+    if k.startswith("backbone.bn1."):
+        _add("backbone.stem.1." + k[len("backbone.bn1."):])
+
+    return cands
+
+
+def _adapt_3ch_to_4ch_conv(src: torch.Tensor, dst: torch.Tensor, dst_key: str) -> Optional[torch.Tensor]:
+    if src.ndim != 4 or dst.ndim != 4:
+        return None
+    if src.shape[1] != 3 or dst.shape[1] != 4:
+        return None
+    if src.shape[0] != dst.shape[0] or tuple(src.shape[2:]) != tuple(dst.shape[2:]):
+        return None
+    if ("stem.0.weight" not in dst_key) and (not dst_key.endswith("conv1.weight")):
+        return None
+    w = dst.clone()
+    with torch.no_grad():
+        w[:, :3].copy_(src)
+        w[:, 3].copy_(src.mean(dim=1))
+    return w
+
+
+def _suffix(k: str, depth: int) -> Optional[str]:
+    parts = str(k).split(".")
+    if len(parts) < int(depth):
+        return None
+    return ".".join(parts[-int(depth):])
+
+
+def load_pretrained_checkpoint(
+    model: nn.Module,
+    ckpt_path: str,
+    *,
+    prefer_key: Optional[str],
+    scope: str,
+    allow_suffix_match: bool,
+) -> Dict[str, Any]:
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"pretrain checkpoint not found: {ckpt_path}")
+
+    scope = str(scope).lower()
+    if scope not in ("all", "backbone"):
+        raise ValueError(f"unsupported pretrain scope: {scope}")
+
+    blob = _safe_torch_load(ckpt_path)
+    src_sd = _extract_state_dict(blob, prefer_key=prefer_key)
+    dst_sd = model.state_dict()
+
+    def _scope_ok(k: str) -> bool:
+        return (scope == "all") or str(k).startswith("backbone.")
+
+    mapped: Dict[str, torch.Tensor] = {}
+    used_dst: set[str] = set()
+    unresolved: List[Tuple[str, torch.Tensor]] = []
+    src_tensor_count = 0
+    src_non_tensor_count = 0
+    exact_loaded = 0
+    alias_loaded = 0
+    suffix_loaded = 0
+    conv_adapted = 0
+    shape_conflicts = 0
+
+    for raw_k, raw_v in src_sd.items():
+        if not torch.is_tensor(raw_v):
+            src_non_tensor_count += 1
+            continue
+        src_tensor_count += 1
+        src_v = raw_v.detach()
+        clean_k = _strip_wrapper_prefixes(str(raw_k))
+        candidates = _alias_candidate_keys(clean_k)
+
+        matched = False
+        had_shape_conflict = False
+        for idx, dst_k in enumerate(candidates):
+            if (not _scope_ok(dst_k)) or (dst_k not in dst_sd) or (dst_k in used_dst):
+                continue
+            dst_v = dst_sd[dst_k]
+            if tuple(src_v.shape) == tuple(dst_v.shape):
+                mapped[dst_k] = src_v
+                used_dst.add(dst_k)
+                if idx == 0 and dst_k == clean_k:
+                    exact_loaded += 1
+                else:
+                    alias_loaded += 1
+                matched = True
+                break
+            adapted = _adapt_3ch_to_4ch_conv(src_v, dst_v, dst_k)
+            if adapted is not None:
+                mapped[dst_k] = adapted
+                used_dst.add(dst_k)
+                conv_adapted += 1
+                matched = True
+                break
+            had_shape_conflict = True
+
+        if not matched:
+            unresolved.append((clean_k, src_v))
+            if had_shape_conflict:
+                shape_conflicts += 1
+
+    unresolved_after_suffix: List[str] = []
+    if allow_suffix_match and unresolved:
+        suffix_index: Dict[Tuple[int, str], List[str]] = {}
+        for dst_k in dst_sd.keys():
+            if (dst_k in used_dst) or (not _scope_ok(dst_k)):
+                continue
+            for depth in (4, 3, 2):
+                sx = _suffix(dst_k, depth)
+                if sx is not None:
+                    suffix_index.setdefault((depth, sx), []).append(dst_k)
+
+        for src_k, src_v in unresolved:
+            found: Optional[Tuple[str, torch.Tensor, bool]] = None
+            for depth in (4, 3, 2):
+                sx = _suffix(src_k, depth)
+                if sx is None:
+                    continue
+                dst_candidates = suffix_index.get((depth, sx), [])
+                if not dst_candidates:
+                    continue
+                valid: List[Tuple[str, torch.Tensor, bool]] = []
+                for dst_k in dst_candidates:
+                    if dst_k in used_dst:
+                        continue
+                    dst_v = dst_sd[dst_k]
+                    if tuple(src_v.shape) == tuple(dst_v.shape):
+                        valid.append((dst_k, src_v, False))
+                    else:
+                        adapted = _adapt_3ch_to_4ch_conv(src_v, dst_v, dst_k)
+                        if adapted is not None:
+                            valid.append((dst_k, adapted, True))
+                if len(valid) == 1:
+                    found = valid[0]
+                    break
+            if found is None:
+                unresolved_after_suffix.append(src_k)
+                continue
+            dst_k, to_load, is_conv_adapt = found
+            mapped[dst_k] = to_load
+            used_dst.add(dst_k)
+            suffix_loaded += 1
+            if is_conv_adapt:
+                conv_adapted += 1
+        unresolved_after_suffix_count = len(unresolved_after_suffix)
+    else:
+        unresolved_after_suffix = [k for k, _ in unresolved]
+        unresolved_after_suffix_count = len(unresolved_after_suffix)
+
+    incompatible = model.load_state_dict(mapped, strict=False)
+    missing = list(getattr(incompatible, "missing_keys", []))
+    unexpected = list(getattr(incompatible, "unexpected_keys", []))
+
+    return {
+        "loaded": len(mapped),
+        "src_tensors": src_tensor_count,
+        "src_non_tensors": src_non_tensor_count,
+        "exact_loaded": exact_loaded,
+        "alias_loaded": alias_loaded,
+        "suffix_loaded": suffix_loaded,
+        "conv_adapted": conv_adapted,
+        "shape_conflicts": shape_conflicts,
+        "missing_keys": len(missing),
+        "unexpected_keys": len(unexpected),
+        "unresolved_src": unresolved_after_suffix_count,
+        "unresolved_src_examples": unresolved_after_suffix[:8],
+    }
+
+
+def resolve_pretrain_mode(args: argparse.Namespace) -> str:
+    mode = str(getattr(args, "pretrain_mode", "none") or "none").lower()
+    if mode not in ("none", "backbone", "checkpoint"):
+        raise ValueError(f"unsupported --pretrain-mode: {mode}")
+
+    # Backward compatibility:
+    # - old configs may only provide backbone_pretrained=true/false
+    legacy_backbone = bool(getattr(args, "backbone_pretrained", False))
+    if mode == "none":
+        if legacy_backbone:
+            mode = "backbone"
+    return mode
 
 
 def save_checkpoint(
@@ -361,7 +767,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dim-feedforward", type=int, default=1024)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--backbone", type=str, default="resnet50", choices=["resnet18", "resnet34", "resnet50"])
-    ap.add_argument("--backbone-pretrained", action="store_true")
+    ap.add_argument(
+        "--backbone-pretrained",
+        action="store_true",
+        help="Legacy alias: equivalent to --pretrain-mode backbone when --pretrain-mode is not set.",
+    )
+    ap.add_argument(
+        "--pretrain-mode",
+        type=str,
+        default="none",
+        choices=["none", "backbone", "checkpoint"],
+        help="Pretrain mode: none=random init, backbone=ImageNet backbone, checkpoint=load --pretrain-ckpt",
+    )
+    ap.add_argument(
+        "--pretrain-ckpt",
+        type=str,
+        default=None,
+        help=(
+            "Pretrained checkpoint for --pretrain-mode checkpoint. "
+            "Supports local path, URL, or official alias (e.g. official:r50_6x_coco)."
+        ),
+    )
+    ap.add_argument("--pretrain-key", type=str, default=None, help="Optional top-level key in checkpoint (e.g. model/state_dict)")
+    ap.add_argument("--pretrain-scope", type=str, default="all", choices=["all", "backbone"], help="Checkpoint load scope")
+    ap.add_argument(
+        "--pretrain-cache-dir",
+        type=str,
+        default="/tmp/torch_hub_checkpoints",
+        help="Cache directory for URL/official checkpoint downloads.",
+    )
+    ap.add_argument(
+        "--no-pretrain-suffix-match",
+        action="store_true",
+        help="Disable unique suffix fallback matching when loading checkpoint pretrain weights.",
+    )
 
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--lr-backbone", type=float, default=2e-5)
@@ -434,6 +873,19 @@ def main() -> None:
         num_classes = int(ds_num_classes)
 
     aifi_layers = int(getattr(args, "aifi_layers", getattr(args, "enc_layers", 1)))
+    pretrain_mode = resolve_pretrain_mode(args)
+    resolved_pretrain_ckpt: Optional[str] = None
+    if (pretrain_mode == "checkpoint") and (not args.pretrain_ckpt):
+        raise ValueError("--pretrain-mode checkpoint requires --pretrain-ckpt")
+    if pretrain_mode == "checkpoint":
+        resolved_pretrain_ckpt, pretrain_source = _resolve_pretrain_ckpt_source(
+            str(args.pretrain_ckpt),
+            str(args.pretrain_cache_dir),
+        )
+        print(f"[init] pretrain_ckpt_source={pretrain_source} resolved={resolved_pretrain_ckpt}", flush=True)
+    if (pretrain_mode == "none") and args.pretrain_ckpt:
+        print("[warn] pretrain_mode=none: ignore --pretrain-ckpt", flush=True)
+
     model = RTDETRRGGB(
         num_classes=num_classes,
         num_queries=int(args.num_queries),
@@ -444,8 +896,33 @@ def main() -> None:
         dim_feedforward=int(args.dim_feedforward),
         dropout=float(args.dropout),
         backbone=str(args.backbone),
-        backbone_pretrained=bool(args.backbone_pretrained),
+        backbone_pretrained=bool(pretrain_mode == "backbone"),
     ).to(device)
+
+    if pretrain_mode == "none":
+        print("[init] pretrain_mode=none (train from scratch)", flush=True)
+    elif pretrain_mode == "backbone":
+        print("[init] pretrain_mode=backbone (ImageNet backbone initialized)", flush=True)
+    else:
+        assert resolved_pretrain_ckpt is not None
+        init_report = load_pretrained_checkpoint(
+            model,
+            ckpt_path=str(resolved_pretrain_ckpt),
+            prefer_key=args.pretrain_key,
+            scope=str(args.pretrain_scope),
+            allow_suffix_match=(not bool(args.no_pretrain_suffix_match)),
+        )
+        print(
+            "[init] pretrain_mode=checkpoint "
+            f"loaded={init_report['loaded']}/{init_report['src_tensors']} "
+            f"exact={init_report['exact_loaded']} alias={init_report['alias_loaded']} "
+            f"suffix={init_report['suffix_loaded']} conv3to4={init_report['conv_adapted']} "
+            f"shape_conflicts={init_report['shape_conflicts']} unresolved_src={init_report['unresolved_src']} "
+            f"missing_after_load={init_report['missing_keys']} unexpected_after_load={init_report['unexpected_keys']}",
+            flush=True,
+        )
+        if init_report["unresolved_src_examples"]:
+            print(f"[init] unresolved_src_examples={init_report['unresolved_src_examples']}", flush=True)
 
     if bool(args.channels_last) and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)

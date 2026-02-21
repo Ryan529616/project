@@ -29,6 +29,12 @@
   "dropout": 0.1,
   "backbone": "resnet50",
   "backbone_pretrained": false,
+  "pretrain_mode": "none",
+  "pretrain_ckpt": null,
+  "pretrain_key": null,
+  "pretrain_scope": "all",
+  "pretrain_cache_dir": "/tmp/torch_hub_checkpoints",
+  "no_pretrain_suffix_match": false,
 
   "lr": 0.00025,
   "lr_backbone": 0.000025,
