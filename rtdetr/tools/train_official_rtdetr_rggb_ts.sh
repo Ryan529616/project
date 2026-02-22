@@ -25,21 +25,29 @@ else
 fi
 
 CFG="${TRAIN_CFG:-${ROOT}/configs/train_rtdetr_rggb.json}"
+PRETRAIN_MODE="${PRETRAIN_MODE:-checkpoint}"
 PRETRAIN_CKPT="${PRETRAIN_CKPT:-official:r50_6x_coco}"
-PRETRAIN_KEY="${PRETRAIN_KEY:-model}"
+PRETRAIN_KEY="${PRETRAIN_KEY:-ema.module}"
 PRETRAIN_SCOPE="${PRETRAIN_SCOPE:-all}"
 PRETRAIN_CACHE_DIR="${PRETRAIN_CACHE_DIR:-/tmp/torch_hub_checkpoints}"
+BACKBONE="${BACKBONE:-resnet50}"
+STRICT_PRETRAIN="${STRICT_PRETRAIN:-1}"
 
 CMD=(
   "${PY}" "${ROOT}/train_rtdetr_rggb.py"
   --cfg "${CFG}"
   --out "${RUN_DIR}"
-  --pretrain-mode checkpoint
+  --backbone "${BACKBONE}"
+  --pretrain-mode "${PRETRAIN_MODE}"
   --pretrain-ckpt "${PRETRAIN_CKPT}"
   --pretrain-key "${PRETRAIN_KEY}"
   --pretrain-scope "${PRETRAIN_SCOPE}"
   --pretrain-cache-dir "${PRETRAIN_CACHE_DIR}"
 )
+
+if [[ "${STRICT_PRETRAIN}" == "1" ]]; then
+  CMD+=(--no-pretrain-suffix-match)
+fi
 
 if [[ "$#" -gt 0 ]]; then
   CMD+=("$@")
@@ -53,10 +61,11 @@ fi
   echo "PRETRAIN_KEY=${PRETRAIN_KEY}"
   echo "PRETRAIN_SCOPE=${PRETRAIN_SCOPE}"
   echo "PRETRAIN_CACHE_DIR=${PRETRAIN_CACHE_DIR}"
+  echo "BACKBONE=${BACKBONE}"
+  echo "STRICT_PRETRAIN=${STRICT_PRETRAIN}"
   printf "CMD="
   printf "%q " "${CMD[@]}"
   echo
 } | tee -a "${CMD_FILE}"
 
 "${CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
-

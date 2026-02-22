@@ -2,12 +2,13 @@
 """
 rtdetr_rggb.py
 
-Baidu RT-DETR style detector adapted for 4-channel RGGB input.
-Main structure:
-1) Multi-scale CNN backbone (C3/C4/C5)
-2) Hybrid Encoder (AIFI + cross-scale feature fusion)
-3) IoU/score-aware top-k query selection from encoder memory
-4) Deformable Transformer Decoder with iterative box refinement
+RT-DETR RGGB model with official-like module topology:
+- backbone.conv1 / backbone.res_layers (PResNet-VD style)
+- encoder.input_proj / encoder.encoder / encoder.lateral_convs / encoder.fpn_blocks /
+  encoder.downsample_convs / encoder.pan_blocks
+- decoder.input_proj / decoder.decoder.layers / decoder.{enc,dec}_* heads
+
+Only the first conv input channel is changed from 3 -> 4 for RGGB.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
 
 
 def _inverse_sigmoid(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -26,19 +26,32 @@ def _inverse_sigmoid(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.log(x / (1.0 - x))
 
 
+def _get_activation(name: str) -> nn.Module:
+    name = str(name).lower()
+    if name == "relu":
+        return nn.ReLU(inplace=True)
+    if name in ("silu", "swish"):
+        return nn.SiLU(inplace=True)
+    if name in ("identity", "none"):
+        return nn.Identity()
+    raise ValueError(f"Unsupported activation: {name}")
+
+
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, num_layers: int = 3):
         super().__init__()
-        layers: List[nn.Module] = []
-        d = int(in_dim)
+        dims = [int(in_dim)]
         for _ in range(max(1, int(num_layers)) - 1):
-            layers += [nn.Linear(d, int(hidden_dim)), nn.ReLU(inplace=True)]
-            d = int(hidden_dim)
-        layers += [nn.Linear(d, int(out_dim))]
-        self.net = nn.Sequential(*layers)
+            dims.append(int(hidden_dim))
+        dims.append(int(out_dim))
+        self.layers = nn.ModuleList([nn.Linear(dims[i], dims[i + 1]) for i in range(len(dims) - 1)])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.layers) - 1:
+                x = F.relu(x, inplace=True)
+        return x
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -50,7 +63,6 @@ class PositionEmbeddingSine(nn.Module):
         self.scale = 2.0 * math.pi
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B,C,H,W]
         b, _, h, w = x.shape
         device = x.device
         mask = torch.zeros((b, h, w), dtype=torch.bool, device=device)
@@ -74,30 +86,53 @@ class PositionEmbeddingSine(nn.Module):
         return pos
 
 
-class ConvNormAct(nn.Module):
-    def __init__(self, c_in: int, c_out: int, k: int = 3, s: int = 1, p: Optional[int] = None):
+class ConvNormLayer(nn.Module):
+    def __init__(
+        self,
+        c_in: int,
+        c_out: int,
+        k: int,
+        s: int,
+        p: Optional[int] = None,
+        *,
+        act: str = "silu",
+        bias: bool = False,
+    ):
         super().__init__()
         if p is None:
             p = int(k) // 2
-        self.conv = nn.Conv2d(int(c_in), int(c_out), kernel_size=int(k), stride=int(s), padding=int(p), bias=False)
-        self.bn = nn.BatchNorm2d(int(c_out))
+        self.conv = nn.Conv2d(int(c_in), int(c_out), kernel_size=int(k), stride=int(s), padding=int(p), bias=bool(bias))
+        self.norm = nn.BatchNorm2d(int(c_out))
+        self.act = _get_activation(act)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.norm(self.conv(x)))
+
+
+class RepVggBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = ConvNormLayer(channels, channels, k=3, s=1, p=1, act="silu")
+        self.conv2 = ConvNormLayer(channels, channels, k=1, s=1, p=0, act="identity")
         self.act = nn.SiLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.conv(x)))
+        return self.act(self.conv2(self.conv1(x)) + x)
 
 
-class RepBlock(nn.Module):
-    """Simple conv block used for CCFM-like fusion."""
-
-    def __init__(self, c_in: int, c_out: int):
+class CSPRepLayer(nn.Module):
+    def __init__(self, c_in: int, c_out: int, num_blocks: int = 3):
         super().__init__()
-        self.cv1 = ConvNormAct(c_in, c_out, k=1, s=1, p=0)
-        self.cv2 = ConvNormAct(c_out, c_out, k=3, s=1, p=1)
-        self.cv3 = ConvNormAct(c_out, c_out, k=3, s=1, p=1)
+        self.conv1 = ConvNormLayer(c_in, c_out, k=1, s=1, p=0, act="silu")
+        self.conv2 = ConvNormLayer(c_in, c_out, k=1, s=1, p=0, act="silu")
+        self.bottlenecks = nn.ModuleList([RepVggBlock(c_out) for _ in range(max(1, int(num_blocks)))])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.cv3(self.cv2(self.cv1(x)))
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        for block in self.bottlenecks:
+            x1 = block(x1)
+        return x1 + x2
 
 
 class TransformerEncoderLayerWithPos(nn.Module):
@@ -122,10 +157,6 @@ class TransformerEncoderLayerWithPos(nn.Module):
 
 
 class AIFIBlock(nn.Module):
-    """
-    Attention-based Intra-scale Feature Interaction on the highest-level feature map.
-    """
-
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float, num_layers: int):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -150,67 +181,129 @@ class AIFIBlock(nn.Module):
         return src.transpose(1, 2).reshape(b, c, h, w).contiguous()
 
 
-class ResNetRGGBBackbone(nn.Module):
-    _SUPPORTED = {"resnet18", "resnet34", "resnet50"}
+class StemBlock(nn.Module):
+    def __init__(self, in_channels: int = 4):
+        super().__init__()
+        self.conv1_1 = ConvNormLayer(int(in_channels), 32, k=3, s=2, p=1, act="relu")
+        self.conv1_2 = ConvNormLayer(32, 32, k=3, s=1, p=1, act="relu")
+        self.conv1_3 = ConvNormLayer(32, 64, k=3, s=1, p=1, act="relu")
 
-    def __init__(self, name: str = "resnet50", pretrained: bool = False):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv1_1(x)
+        x = self.conv1_2(x)
+        x = self.conv1_3(x)
+        return x
+
+
+class ShortCut(nn.Module):
+    def __init__(self, c_in: int, c_out: int, stride: int):
+        super().__init__()
+        stride = int(stride)
+        if stride > 1:
+            self.pool = nn.AvgPool2d(kernel_size=2, stride=2, ceil_mode=True)
+        else:
+            self.pool = None
+        self.conv = ConvNormLayer(c_in, c_out, k=1, s=1, p=0, act="identity")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.pool is not None:
+            x = self.pool(x)
+        return self.conv(x)
+
+
+class ResBottleNeckBlock(nn.Module):
+    expansion = 4
+
+    def __init__(self, c_in: int, c_mid: int, stride: int, shortcut: bool):
+        super().__init__()
+        stride = int(stride)
+        self.stride = stride
+        self.shortcut = bool(shortcut)
+
+        self.branch2a = ConvNormLayer(c_in, c_mid, k=1, s=1, p=0, act="relu")
+        self.branch2b = ConvNormLayer(c_mid, c_mid, k=3, s=stride, p=1, act="relu")
+        self.branch2c = ConvNormLayer(c_mid, c_mid * self.expansion, k=1, s=1, p=0, act="identity")
+
+        if self.shortcut:
+            if stride > 1:
+                self.short = ShortCut(c_in=c_in, c_out=c_mid * self.expansion, stride=stride)
+            else:
+                # Keep stage-0 key shape compatible with official checkpoint:
+                # backbone.res_layers.0.blocks.0.short.conv.weight
+                self.short = ConvNormLayer(c_in, c_mid * self.expansion, k=1, s=1, p=0, act="identity")
+        else:
+            self.short = None
+
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.branch2c(self.branch2b(self.branch2a(x)))
+
+        if self.short is None:
+            identity = x
+        else:
+            identity = self.short(x)
+
+        out = out + identity
+        return self.act(out)
+
+
+class ResStage(nn.Module):
+    def __init__(self, blocks: Sequence[nn.Module]):
+        super().__init__()
+        self.blocks = nn.ModuleList(list(blocks))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+class PResNetBackbone(nn.Module):
+    _SUPPORTED = {"resnet50", "r50", "r50vd"}
+
+    def __init__(self, name: str = "resnet50", in_channels: int = 4):
         super().__init__()
         name = str(name).lower()
         if name not in self._SUPPORTED:
-            raise ValueError(f"Unsupported backbone: {name}. Supported: {sorted(self._SUPPORTED)}")
+            raise ValueError(f"Unsupported backbone for official RT-DETR topology: {name}. Supported: {sorted(self._SUPPORTED)}")
 
-        if name == "resnet18":
-            weights = torchvision.models.ResNet18_Weights.DEFAULT if pretrained else None
-            net = torchvision.models.resnet18(weights=weights)
-            self.out_channels = (128, 256, 512)
-        elif name == "resnet34":
-            weights = torchvision.models.ResNet34_Weights.DEFAULT if pretrained else None
-            net = torchvision.models.resnet34(weights=weights)
-            self.out_channels = (128, 256, 512)
-        else:
-            weights = torchvision.models.ResNet50_Weights.DEFAULT if pretrained else None
-            net = torchvision.models.resnet50(weights=weights)
-            self.out_channels = (512, 1024, 2048)
+        self.conv1 = StemBlock(in_channels=int(in_channels))
+        self.pool2d_max = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        old_conv1 = net.conv1
-        new_conv1 = nn.Conv2d(
-            4,
-            old_conv1.out_channels,
-            kernel_size=old_conv1.kernel_size,
-            stride=old_conv1.stride,
-            padding=old_conv1.padding,
-            bias=False,
-        )
-        with torch.no_grad():
-            if old_conv1.weight.shape[1] == 3:
-                new_conv1.weight[:, :3].copy_(old_conv1.weight)
-                new_conv1.weight[:, 3].copy_(old_conv1.weight.mean(dim=1))
-            else:
-                nn.init.kaiming_normal_(new_conv1.weight, mode="fan_out", nonlinearity="relu")
-        net.conv1 = new_conv1
+        depths = (3, 4, 6, 3)
+        stage_channels = (64, 128, 256, 512)
 
-        self.stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)
-        self.layer1 = net.layer1
-        self.layer2 = net.layer2
-        self.layer3 = net.layer3
-        self.layer4 = net.layer4
+        in_c = 64
+        stages: List[nn.Module] = []
+        for stage_idx, (depth, c_mid) in enumerate(zip(depths, stage_channels)):
+            blocks: List[nn.Module] = []
+            for block_idx in range(int(depth)):
+                stride = 2 if (stage_idx > 0 and block_idx == 0) else 1
+                shortcut = block_idx == 0
+                block = ResBottleNeckBlock(c_in=in_c, c_mid=int(c_mid), stride=int(stride), shortcut=bool(shortcut))
+                blocks.append(block)
+                in_c = int(c_mid) * ResBottleNeckBlock.expansion
+            stages.append(ResStage(blocks))
+        self.res_layers = nn.ModuleList(stages)
+
+        # RT-DETR consumes C3/C4/C5 equivalent (512/1024/2048 for R50).
+        self.out_indices = (1, 2, 3)
+        self.out_channels = (512, 1024, 2048)
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        x = self.stem(x)
-        x = self.layer1(x)
-        c3 = self.layer2(x)  # stride 8
-        c4 = self.layer3(c3)  # stride 16
-        c5 = self.layer4(c4)  # stride 32
-        return [c3, c4, c5]
+        x = self.conv1(x)
+        x = self.pool2d_max(x)
+
+        outs: List[torch.Tensor] = []
+        for i, layer in enumerate(self.res_layers):
+            x = layer(x)
+            if i in self.out_indices:
+                outs.append(x)
+        return outs
 
 
 class HybridEncoder(nn.Module):
-    """
-    RT-DETR style Hybrid Encoder:
-    - AIFI on top-level feature
-    - Cross-scale fusion (FPN top-down + PAN bottom-up)
-    """
-
     def __init__(
         self,
         in_channels: Sequence[int],
@@ -222,40 +315,64 @@ class HybridEncoder(nn.Module):
     ):
         super().__init__()
         in_channels = [int(c) for c in in_channels]
-        self.in_proj = nn.ModuleList([nn.Conv2d(c, int(hidden_dim), kernel_size=1, bias=False) for c in in_channels])
+        self.hidden_dim = int(hidden_dim)
 
-        self.aifi = AIFIBlock(
-            d_model=int(hidden_dim),
-            nhead=int(nhead),
-            dim_feedforward=int(dim_feedforward),
-            dropout=float(dropout),
-            num_layers=int(aifi_layers),
+        self.input_proj = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(c, self.hidden_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(self.hidden_dim),
+                )
+                for c in in_channels
+            ]
         )
 
-        self.reduce_p5 = ConvNormAct(hidden_dim, hidden_dim, k=1, s=1, p=0)
-        self.reduce_p4 = ConvNormAct(hidden_dim, hidden_dim, k=1, s=1, p=0)
-        self.fpn4 = RepBlock(hidden_dim * 2, hidden_dim)
-        self.fpn3 = RepBlock(hidden_dim * 2, hidden_dim)
+        self.encoder = nn.ModuleList(
+            [
+                AIFIBlock(
+                    d_model=self.hidden_dim,
+                    nhead=int(nhead),
+                    dim_feedforward=int(dim_feedforward),
+                    dropout=float(dropout),
+                    num_layers=int(aifi_layers),
+                )
+            ]
+        )
 
-        self.down_p3 = ConvNormAct(hidden_dim, hidden_dim, k=3, s=2, p=1)
-        self.down_p4 = ConvNormAct(hidden_dim, hidden_dim, k=3, s=2, p=1)
-        self.pan4 = RepBlock(hidden_dim * 2, hidden_dim)
-        self.pan5 = RepBlock(hidden_dim * 2, hidden_dim)
+        self.lateral_convs = nn.ModuleList(
+            [ConvNormLayer(self.hidden_dim, self.hidden_dim, k=1, s=1, p=0, act="silu") for _ in range(2)]
+        )
+        self.fpn_blocks = nn.ModuleList(
+            [CSPRepLayer(self.hidden_dim * 2, self.hidden_dim, num_blocks=3) for _ in range(2)]
+        )
+
+        self.downsample_convs = nn.ModuleList(
+            [ConvNormLayer(self.hidden_dim, self.hidden_dim, k=3, s=2, p=1, act="silu") for _ in range(2)]
+        )
+        self.pan_blocks = nn.ModuleList(
+            [CSPRepLayer(self.hidden_dim * 2, self.hidden_dim, num_blocks=3) for _ in range(2)]
+        )
 
     def forward(self, feats: List[torch.Tensor]) -> List[torch.Tensor]:
-        x3, x4, x5 = [proj(f) for proj, f in zip(self.in_proj, feats)]
-        x5 = self.aifi(x5)
+        x3, x4, x5 = [proj(f) for proj, f in zip(self.input_proj, feats)]
 
-        p5 = x5
-        up_p5 = F.interpolate(self.reduce_p5(p5), size=x4.shape[-2:], mode="nearest")
-        p4 = self.fpn4(torch.cat([x4, up_p5], dim=1))
+        for enc in self.encoder:
+            x5 = enc(x5)
 
-        up_p4 = F.interpolate(self.reduce_p4(p4), size=x3.shape[-2:], mode="nearest")
-        p3 = self.fpn3(torch.cat([x3, up_p4], dim=1))
+        # top-down FPN
+        inner_outs: List[torch.Tensor] = [x5]
+        for i in range(2):
+            high = inner_outs[0]
+            low = x4 if i == 0 else x3
+            up = F.interpolate(self.lateral_convs[i](high), size=low.shape[-2:], mode="nearest")
+            inner_outs.insert(0, self.fpn_blocks[i](torch.cat([up, low], dim=1)))
 
-        n4 = self.pan4(torch.cat([self.down_p3(p3), p4], dim=1))
-        n5 = self.pan5(torch.cat([self.down_p4(n4), p5], dim=1))
-        return [p3, n4, n5]
+        # bottom-up PAN
+        outs: List[torch.Tensor] = [inner_outs[0]]
+        for i in range(2):
+            down = self.downsample_convs[i](outs[-1])
+            outs.append(self.pan_blocks[i](torch.cat([down, inner_outs[i + 1]], dim=1)))
+        return outs
 
 
 class MSDeformableAttention(nn.Module):
@@ -306,9 +423,6 @@ class MSDeformableAttention(nn.Module):
         level_start_index: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # query: [B, Q, C]
-        # reference_points: [B, Q, L, 2] or [B, Q, L, 4]
-        # value: [B, S, C]
         bsz, num_query, _ = query.shape
         _, num_value, _ = value.shape
         if int(spatial_shapes[:, 0].mul(spatial_shapes[:, 1]).sum().item()) != int(num_value):
@@ -347,10 +461,10 @@ class MSDeformableAttention(nn.Module):
             h_l, w_l = int(h_l), int(w_l)
             start = int(level_start_index[lvl].item())
             end = start + h_l * w_l
-            value_l = value[:, start:end, :, :]  # [B, Hl*Wl, H, D]
+            value_l = value[:, start:end, :, :]
             value_l = value_l.permute(0, 2, 3, 1).reshape(bsz * self.num_heads, self.head_dim, h_l, w_l)
 
-            sampling_grid = sampling_locations[:, :, :, lvl, :, :]  # [B,Q,H,P,2]
+            sampling_grid = sampling_locations[:, :, :, lvl, :, :]
             sampling_grid = sampling_grid.permute(0, 2, 1, 3, 4).reshape(
                 bsz * self.num_heads, num_query, self.num_points, 2
             )
@@ -362,12 +476,12 @@ class MSDeformableAttention(nn.Module):
                 mode="bilinear",
                 padding_mode="zeros",
                 align_corners=False,
-            )  # [B*H, D, Q, P]
+            )
             sampled = sampled.view(bsz, self.num_heads, self.head_dim, num_query, self.num_points)
 
-            attn = attention_weights[:, :, :, lvl, :]  # [B,Q,H,P]
-            attn = attn.permute(0, 2, 1, 3).unsqueeze(2)  # [B,H,1,Q,P]
-            out_l = (sampled * attn).sum(dim=-1)  # [B,H,D,Q]
+            attn = attention_weights[:, :, :, lvl, :]
+            attn = attn.permute(0, 2, 1, 3).unsqueeze(2)
+            out_l = (sampled * attn).sum(dim=-1)
             output = output + out_l.permute(0, 3, 1, 2)
 
         output = output.reshape(bsz, num_query, self.embed_dim)
@@ -430,9 +544,199 @@ class RTDETRDecoderLayer(nn.Module):
         return tgt
 
 
+class TransformerDecoder(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        num_layers: int,
+        num_levels: int,
+        num_points: int,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                RTDETRDecoderLayer(
+                    d_model=int(d_model),
+                    nhead=int(nhead),
+                    dim_feedforward=int(dim_feedforward),
+                    dropout=float(dropout),
+                    num_levels=int(num_levels),
+                    num_points=int(num_points),
+                )
+                for _ in range(max(1, int(num_layers)))
+            ]
+        )
+
+
+class RTDETRDecoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_classes: int,
+        num_queries: int,
+        hidden_dim: int,
+        nhead: int,
+        dec_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        num_feature_levels: int,
+        num_points: int,
+        anchor_scale: float,
+    ):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.num_queries = int(num_queries)
+        self.hidden_dim = int(hidden_dim)
+        self.num_feature_levels = int(num_feature_levels)
+        self.anchor_scale = float(anchor_scale)
+
+        self.input_proj = nn.ModuleList(
+            [ConvNormLayer(self.hidden_dim, self.hidden_dim, k=1, s=1, p=0, act="identity") for _ in range(self.num_feature_levels)]
+        )
+
+        self.decoder = TransformerDecoder(
+            d_model=self.hidden_dim,
+            nhead=int(nhead),
+            dim_feedforward=int(dim_feedforward),
+            dropout=float(dropout),
+            num_layers=int(dec_layers),
+            num_levels=self.num_feature_levels,
+            num_points=int(num_points),
+        )
+
+        self.enc_output = nn.Sequential(nn.Linear(self.hidden_dim, self.hidden_dim), nn.LayerNorm(self.hidden_dim))
+        self.enc_score_head = nn.Linear(self.hidden_dim, self.num_classes)
+        self.enc_bbox_head = MLP(self.hidden_dim, self.hidden_dim, 4, num_layers=3)
+        self.query_pos_head = MLP(4, self.hidden_dim * 2, self.hidden_dim, num_layers=2)
+
+        self.dec_score_head = nn.ModuleList([nn.Linear(self.hidden_dim, self.num_classes) for _ in self.decoder.layers])
+        self.dec_bbox_head = nn.ModuleList([MLP(self.hidden_dim, self.hidden_dim, 4, num_layers=3) for _ in self.decoder.layers])
+
+        # Keep official key for checkpoint compatibility (not used in this training loop).
+        self.denoising_class_embed = nn.Embedding(self.num_classes + 1, self.hidden_dim)
+
+        self.pos_embed = PositionEmbeddingSine(num_pos_feats=self.hidden_dim // 2, normalize=True)
+
+    @staticmethod
+    def _batch_gather(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        b, _, c = x.shape
+        gather_idx = idx.unsqueeze(-1).expand(b, idx.size(1), c)
+        return torch.gather(x, dim=1, index=gather_idx)
+
+    def _build_memory(self, features: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        src_list: List[torch.Tensor] = []
+        spatial_shapes: List[Tuple[int, int]] = []
+        for feat in features:
+            b, _, h, w = feat.shape
+            pos = self.pos_embed(feat).flatten(2).transpose(1, 2).contiguous()
+            src = feat.flatten(2).transpose(1, 2).contiguous()
+            src_list.append(src + pos)
+            spatial_shapes.append((h, w))
+
+        memory = torch.cat(src_list, dim=1)
+        spatial_shapes_t = torch.tensor(spatial_shapes, dtype=torch.long, device=memory.device)
+        level_start_index = torch.cat(
+            [
+                spatial_shapes_t.new_zeros((1,)),
+                spatial_shapes_t[:, 0].mul(spatial_shapes_t[:, 1]).cumsum(dim=0)[:-1],
+            ]
+        )
+        return memory, spatial_shapes_t, level_start_index
+
+    def _generate_anchors(
+        self,
+        spatial_shapes: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        anchors: List[torch.Tensor] = []
+        for lvl, (h, w) in enumerate(spatial_shapes.tolist()):
+            h, w = int(h), int(w)
+            y, x = torch.meshgrid(
+                torch.arange(h, device=device, dtype=dtype),
+                torch.arange(w, device=device, dtype=dtype),
+                indexing="ij",
+            )
+            cx = (x + 0.5) / float(max(1, w))
+            cy = (y + 0.5) / float(max(1, h))
+            wh = torch.full_like(cx, self.anchor_scale * (2.0 ** lvl))
+            anchors.append(torch.stack([cx, cy, wh, wh], dim=-1).view(-1, 4))
+        return torch.cat(anchors, dim=0).unsqueeze(0)
+
+    def _select_queries(
+        self,
+        memory: torch.Tensor,
+        spatial_shapes: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        anchors = self._generate_anchors(spatial_shapes, device=memory.device, dtype=memory.dtype)
+        enc_feat = self.enc_output(torch.nan_to_num(memory, nan=0.0, posinf=1e4, neginf=-1e4))
+        enc_logits = torch.nan_to_num(self.enc_score_head(enc_feat), nan=0.0, posinf=50.0, neginf=-50.0)
+        enc_box_unact = self.enc_bbox_head(enc_feat) + _inverse_sigmoid(anchors)
+        enc_boxes = torch.nan_to_num(enc_box_unact.sigmoid(), nan=0.5, posinf=1.0, neginf=0.0).clamp(1e-4, 1.0 - 1e-4)
+
+        scores = torch.nan_to_num(enc_logits.max(dim=-1).values, nan=-1e6, posinf=1e6, neginf=-1e6)
+        topk_idx = torch.topk(scores, k=min(self.num_queries, scores.size(1)), dim=1).indices
+
+        tgt = self._batch_gather(enc_feat, topk_idx)
+        ref_boxes = self._batch_gather(enc_boxes, topk_idx).detach()
+        enc_logits_q = self._batch_gather(enc_logits, topk_idx)
+        enc_boxes_q = self._batch_gather(enc_boxes, topk_idx)
+        return tgt, ref_boxes, enc_logits_q, enc_boxes_q
+
+    def forward(self, features: List[torch.Tensor]) -> Dict[str, torch.Tensor | List[Dict[str, torch.Tensor]]]:
+        feats = [proj(f) for proj, f in zip(self.input_proj, features)]
+        memory, spatial_shapes, level_start_index = self._build_memory(feats)
+
+        tgt, ref_boxes, enc_logits, enc_boxes = self._select_queries(memory, spatial_shapes)
+
+        outputs_logits: List[torch.Tensor] = []
+        outputs_boxes: List[torch.Tensor] = []
+
+        for i, layer in enumerate(self.decoder.layers):
+            query_pos = self.query_pos_head(ref_boxes)
+            ref_points = ref_boxes[:, :, None, :].repeat(1, 1, self.num_feature_levels, 1)
+            tgt = layer(
+                tgt=tgt,
+                query_pos=query_pos,
+                reference_points=ref_points,
+                memory=memory,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+            )
+            logits_i = torch.nan_to_num(self.dec_score_head[i](tgt), nan=0.0, posinf=50.0, neginf=-50.0)
+            box_i = self.dec_bbox_head[i](tgt)
+            box_i = (box_i + _inverse_sigmoid(ref_boxes)).sigmoid()
+            box_i = torch.nan_to_num(box_i, nan=0.5, posinf=1.0, neginf=0.0).clamp(1e-4, 1.0 - 1e-4)
+            outputs_logits.append(logits_i)
+            outputs_boxes.append(box_i)
+            ref_boxes = box_i.detach()
+
+        pred_logits = outputs_logits[-1]
+        pred_boxes = outputs_boxes[-1]
+
+        aux_outputs: List[Dict[str, torch.Tensor]] = []
+        if len(outputs_logits) > 1:
+            for i in range(len(outputs_logits) - 1):
+                aux_outputs.append({"pred_logits": outputs_logits[i], "pred_boxes": outputs_boxes[i]})
+
+        return {
+            "pred_logits": pred_logits,
+            "pred_boxes": pred_boxes,
+            "aux_outputs": aux_outputs,
+            "enc_aux_outputs": {
+                "pred_logits": enc_logits,
+                "pred_boxes": enc_boxes,
+            },
+        }
+
+
 class RTDETRRGGB(nn.Module):
     """
-    RT-DETR style detector for RGGB inputs.
+    RT-DETR RGGB detector with official-like module topology.
     """
 
     def __init__(
@@ -453,6 +757,8 @@ class RTDETRRGGB(nn.Module):
         anchor_scale: float = 0.05,
     ):
         super().__init__()
+        del backbone_pretrained  # Not used for official-structure backbone.
+
         if int(d_model) % int(nhead) != 0:
             raise ValueError(f"d_model({d_model}) must be divisible by nhead({nhead})")
         if int(num_feature_levels) != 3:
@@ -461,11 +767,9 @@ class RTDETRRGGB(nn.Module):
         self.num_classes = int(num_classes)
         self.num_queries = int(num_queries)
         self.d_model = int(d_model)
-        self.has_bg = True
-        self.num_feature_levels = int(num_feature_levels)
-        self.anchor_scale = float(anchor_scale)
+        self.has_bg = False
 
-        self.backbone = ResNetRGGBBackbone(name=backbone, pretrained=bool(backbone_pretrained))
+        self.backbone = PResNetBackbone(name=backbone, in_channels=4)
         self.encoder = HybridEncoder(
             in_channels=self.backbone.out_channels,
             hidden_dim=self.d_model,
@@ -474,32 +778,18 @@ class RTDETRRGGB(nn.Module):
             dropout=float(dropout),
             aifi_layers=int(aifi_layers),
         )
-
-        self.level_embed = nn.Embedding(self.num_feature_levels, self.d_model)
-        self.pos_embed = PositionEmbeddingSine(num_pos_feats=self.d_model // 2, normalize=True)
-
-        self.enc_output = nn.Linear(self.d_model, self.d_model)
-        self.enc_output_norm = nn.LayerNorm(self.d_model)
-        self.enc_score_head = nn.Linear(self.d_model, self.num_classes + 1)
-        self.enc_bbox_head = MLP(self.d_model, self.d_model, 4, num_layers=3)
-
-        self.query_pos_head = MLP(4, self.d_model, self.d_model, num_layers=2)
-
-        self.decoder_layers = nn.ModuleList(
-            [
-                RTDETRDecoderLayer(
-                    d_model=self.d_model,
-                    nhead=int(nhead),
-                    dim_feedforward=int(dim_feedforward),
-                    dropout=float(dropout),
-                    num_levels=self.num_feature_levels,
-                    num_points=int(num_points),
-                )
-                for _ in range(max(1, int(dec_layers)))
-            ]
+        self.decoder = RTDETRDecoder(
+            num_classes=self.num_classes,
+            num_queries=self.num_queries,
+            hidden_dim=self.d_model,
+            nhead=int(nhead),
+            dec_layers=int(dec_layers),
+            dim_feedforward=int(dim_feedforward),
+            dropout=float(dropout),
+            num_feature_levels=int(num_feature_levels),
+            num_points=int(num_points),
+            anchor_scale=float(anchor_scale),
         )
-        self.dec_score_heads = nn.ModuleList([nn.Linear(self.d_model, self.num_classes + 1) for _ in self.decoder_layers])
-        self.dec_bbox_heads = nn.ModuleList([MLP(self.d_model, self.d_model, 4, num_layers=3) for _ in self.decoder_layers])
 
         self._reset_parameters()
 
@@ -514,78 +804,6 @@ class RTDETRRGGB(nn.Module):
                     nn.init.ones_(m.weight)
                 if getattr(m, "bias", None) is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.normal_(self.level_embed.weight, mean=0.0, std=0.02)
-
-    @staticmethod
-    def _batch_gather(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        # x: [B,N,C], idx: [B,K]
-        b, _, c = x.shape
-        gather_idx = idx.unsqueeze(-1).expand(b, idx.size(1), c)
-        return torch.gather(x, dim=1, index=gather_idx)
-
-    def _build_memory(
-        self, features: List[torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        src_list: List[torch.Tensor] = []
-        spatial_shapes: List[Tuple[int, int]] = []
-        for lvl, feat in enumerate(features):
-            b, _, h, w = feat.shape
-            pos = self.pos_embed(feat).flatten(2).transpose(1, 2).contiguous()
-            src = feat.flatten(2).transpose(1, 2).contiguous()
-            src = src + pos + self.level_embed.weight[lvl].view(1, 1, -1).to(dtype=src.dtype, device=src.device)
-            src_list.append(src)
-            spatial_shapes.append((h, w))
-
-        memory = torch.cat(src_list, dim=1)
-        spatial_shapes_t = torch.tensor(spatial_shapes, dtype=torch.long, device=memory.device)
-        level_start_index = torch.cat(
-            [
-                spatial_shapes_t.new_zeros((1,)),
-                spatial_shapes_t[:, 0].mul(spatial_shapes_t[:, 1]).cumsum(dim=0)[:-1],
-            ]
-        )
-        return memory, spatial_shapes_t, level_start_index
-
-    def _generate_anchors(
-        self, spatial_shapes: torch.Tensor, *, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
-        # Return anchors in normalized cxcywh: [1, sum(HW), 4]
-        anchors: List[torch.Tensor] = []
-        for lvl, (h, w) in enumerate(spatial_shapes.tolist()):
-            h, w = int(h), int(w)
-            y, x = torch.meshgrid(
-                torch.arange(h, device=device, dtype=dtype),
-                torch.arange(w, device=device, dtype=dtype),
-                indexing="ij",
-            )
-            cx = (x + 0.5) / float(max(1, w))
-            cy = (y + 0.5) / float(max(1, h))
-            wh = torch.full_like(cx, self.anchor_scale * (2.0**lvl))
-            anchor_l = torch.stack([cx, cy, wh, wh], dim=-1).view(-1, 4)
-            anchors.append(anchor_l)
-        return torch.cat(anchors, dim=0).unsqueeze(0)
-
-    def _select_queries(
-        self, memory: torch.Tensor, spatial_shapes: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        anchors = self._generate_anchors(spatial_shapes, device=memory.device, dtype=memory.dtype)
-        enc_feat = self.enc_output_norm(self.enc_output(memory))
-        enc_feat = torch.nan_to_num(enc_feat, nan=0.0, posinf=1e4, neginf=-1e4)
-        enc_logits = self.enc_score_head(enc_feat)
-        enc_logits = torch.nan_to_num(enc_logits, nan=0.0, posinf=50.0, neginf=-50.0)
-        enc_box_unact = self.enc_bbox_head(enc_feat) + _inverse_sigmoid(anchors)
-        enc_boxes = enc_box_unact.sigmoid()
-        enc_boxes = torch.nan_to_num(enc_boxes, nan=0.5, posinf=1.0, neginf=0.0).clamp(1e-4, 1.0 - 1e-4)
-
-        fg_scores = enc_logits[..., : self.num_classes].max(dim=-1).values
-        fg_scores = torch.nan_to_num(fg_scores, nan=-1e6, posinf=1e6, neginf=-1e6)
-        topk_idx = torch.topk(fg_scores, k=min(self.num_queries, fg_scores.size(1)), dim=1).indices
-
-        tgt = self._batch_gather(enc_feat, topk_idx)
-        ref_boxes = self._batch_gather(enc_boxes, topk_idx).detach()
-        enc_logits_q = self._batch_gather(enc_logits, topk_idx)
-        enc_boxes_q = self._batch_gather(enc_boxes, topk_idx)
-        return tgt, ref_boxes, enc_logits_q, enc_boxes_q
 
     def forward(self, x: torch.Tensor | Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor | List[Dict[str, torch.Tensor]]]:
         if isinstance(x, dict):
@@ -596,61 +814,24 @@ class RTDETRRGGB(nn.Module):
             raw4 = x
 
         feats = self.backbone(raw4)
-        feats = self.encoder(feats)  # [P3,P4,P5], each [B,C,H,W]
-        memory, spatial_shapes, level_start_index = self._build_memory(feats)
+        feats = self.encoder(feats)
+        out = self.decoder(feats)
 
-        tgt, ref_boxes, enc_logits, enc_boxes = self._select_queries(memory, spatial_shapes)
+        out["num_classes"] = self.num_classes
+        out["has_bg"] = self.has_bg
 
-        outputs_logits: List[torch.Tensor] = []
-        outputs_boxes: List[torch.Tensor] = []
+        aux = out.get("aux_outputs", None)
+        if isinstance(aux, list):
+            for item in aux:
+                item["num_classes"] = self.num_classes
+                item["has_bg"] = self.has_bg
 
-        for i, layer in enumerate(self.decoder_layers):
-            query_pos = self.query_pos_head(ref_boxes)
-            ref_points = ref_boxes[:, :, None, :].repeat(1, 1, self.num_feature_levels, 1)
-            tgt = layer(
-                tgt=tgt,
-                query_pos=query_pos,
-                reference_points=ref_points,
-                memory=memory,
-                spatial_shapes=spatial_shapes,
-                level_start_index=level_start_index,
-            )
-            logits_i = self.dec_score_heads[i](tgt)
-            logits_i = torch.nan_to_num(logits_i, nan=0.0, posinf=50.0, neginf=-50.0)
-            box_delta = self.dec_bbox_heads[i](tgt)
-            box_i = (box_delta + _inverse_sigmoid(ref_boxes)).sigmoid()
-            box_i = torch.nan_to_num(box_i, nan=0.5, posinf=1.0, neginf=0.0).clamp(1e-4, 1.0 - 1e-4)
-            outputs_logits.append(logits_i)
-            outputs_boxes.append(box_i)
-            ref_boxes = box_i.detach()
+        enc_aux = out.get("enc_aux_outputs", None)
+        if isinstance(enc_aux, dict):
+            enc_aux["num_classes"] = self.num_classes
+            enc_aux["has_bg"] = self.has_bg
 
-        pred_logits = torch.nan_to_num(outputs_logits[-1], nan=0.0, posinf=50.0, neginf=-50.0)
-        pred_boxes = torch.nan_to_num(outputs_boxes[-1], nan=0.5, posinf=1.0, neginf=0.0).clamp(1e-4, 1.0 - 1e-4)
-        aux_outputs: List[Dict[str, torch.Tensor]] = []
-        if len(outputs_logits) > 1:
-            for i in range(len(outputs_logits) - 1):
-                aux_outputs.append(
-                    {
-                        "pred_logits": outputs_logits[i],
-                        "pred_boxes": outputs_boxes[i],
-                        "num_classes": self.num_classes,
-                        "has_bg": self.has_bg,
-                    }
-                )
-
-        return {
-            "pred_logits": pred_logits,
-            "pred_boxes": pred_boxes,
-            "aux_outputs": aux_outputs,
-            "num_classes": self.num_classes,
-            "has_bg": self.has_bg,
-            "enc_aux_outputs": {
-                "pred_logits": enc_logits,
-                "pred_boxes": enc_boxes,
-                "num_classes": self.num_classes,
-                "has_bg": self.has_bg,
-            },
-        }
+        return out
 
 
 __all__ = ["RTDETRRGGB"]

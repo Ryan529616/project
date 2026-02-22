@@ -338,7 +338,12 @@ def _adapt_3ch_to_4ch_conv(src: torch.Tensor, dst: torch.Tensor, dst_key: str) -
         return None
     if src.shape[0] != dst.shape[0] or tuple(src.shape[2:]) != tuple(dst.shape[2:]):
         return None
-    if ("stem.0.weight" not in dst_key) and (not dst_key.endswith("conv1.weight")):
+    is_first_conv = (
+        ("stem.0.weight" in dst_key)
+        or dst_key.endswith("conv1.weight")
+        or dst_key.endswith("conv1_1.conv.weight")
+    )
+    if not is_first_conv:
         return None
     w = dst.clone()
     with torch.no_grad():
@@ -687,6 +692,25 @@ def evaluate(
 
     loss_sum = 0.0
     n = 0
+
+    def _prepare_outputs_for_decode(outputs: Dict[str, Any], nc: int) -> Dict[str, Any]:
+        if not isinstance(outputs, dict):
+            return outputs
+        logits = outputs.get("pred_logits", None)
+        if not torch.is_tensor(logits) or logits.ndim != 3:
+            return outputs
+        has_bg = bool(outputs.get("has_bg", False))
+        if has_bg:
+            return outputs
+        if int(logits.shape[-1]) != int(nc):
+            return outputs
+
+        bg = torch.zeros((logits.shape[0], logits.shape[1], 1), dtype=logits.dtype, device=logits.device)
+        out = dict(outputs)
+        out["pred_logits"] = torch.cat([logits, bg], dim=-1)
+        out["has_bg"] = True
+        return out
+
     for it, batch in enumerate(loader):
         if max_val_iters > 0 and it >= max_val_iters:
             break
@@ -704,8 +728,9 @@ def evaluate(
         loss_sum += float(loss.item())
         n += 1
 
-        meter50.update(out, targets, score_thr=score_thr, max_dets=max_dets, nms_iou=nms_iou)
-        meter_coco.update(out, targets, score_thr=score_thr, max_dets=max_dets, nms_iou=nms_iou)
+        out_decode = _prepare_outputs_for_decode(out, nc=num_classes)
+        meter50.update(out_decode, targets, score_thr=score_thr, max_dets=max_dets, nms_iou=nms_iou)
+        meter_coco.update(out_decode, targets, score_thr=score_thr, max_dets=max_dets, nms_iou=nms_iou)
 
     res50 = meter50.compute(iou_thrs=0.5)
     rescoco = meter_coco.compute()
@@ -766,7 +791,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dec-layers", type=int, default=6)
     ap.add_argument("--dim-feedforward", type=int, default=1024)
     ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--backbone", type=str, default="resnet50", choices=["resnet18", "resnet34", "resnet50"])
+    ap.add_argument("--backbone", type=str, default="resnet50", choices=["resnet50", "r50", "r50vd"])
     ap.add_argument(
         "--backbone-pretrained",
         action="store_true",
